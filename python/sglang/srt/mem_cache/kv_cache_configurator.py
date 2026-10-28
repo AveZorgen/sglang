@@ -1933,6 +1933,38 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def npu_int8_indexer_layer_ids(
+        self, *, candidate_layer_ids: tuple[int, ...], index_head_dim: Optional[int]
+    ) -> frozenset[int]:
+        """Indexer layers whose K cache the NPU pool stores as INT8."""
+        from sglang.srt.hardware_backend.npu.dsa_int8_indexer import (
+            resolve_npu_int8_indexer_layer_ids,
+        )
+
+        enable_int8_indexer = envs.SGLANG_NPU_ENABLE_INT8_DSA_INDEXER.get()
+        quant_description = None
+        if enable_int8_indexer and not self.is_draft_worker:
+            from sglang.srt.layers.quantization.modelslim.modelslim import (
+                ModelSlimConfig,
+            )
+
+            quant_config = self.model.quant_config
+            if isinstance(quant_config, ModelSlimConfig):
+                quant_description = quant_config.quant_description
+        memory_config = get_memory()
+        return resolve_npu_int8_indexer_layer_ids(
+            enable_int8_indexer=enable_int8_indexer,
+            is_npu=_is_npu,
+            index_head_dim=index_head_dim,
+            kv_cache_is_fp8=self.kv_cache_dtype == torch.float8_e4m3fn,
+            enable_hierarchical_cache=memory_config.enable_hierarchical_cache,
+            enable_hisparse=memory_config.enable_hisparse,
+            enable_sparse_kv_offload=envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get(),
+            is_draft_worker=self.is_draft_worker,
+            candidate_layer_ids=candidate_layer_ids,
+            modelslim_quant_description=quant_description,
+        )
+
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
@@ -1966,6 +1998,30 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
+        candidate_layer_ids = ()
+        if is_dsa_model:
+            # Mirrors NPUMLATokenToKVPool's default indexer layer set.
+            candidate_layer_ids = (
+                indexer_layer_ids
+                if indexer_layer_ids is not None
+                else tuple(
+                    range(
+                        self.layer_info.start_layer,
+                        self.layer_info.start_layer
+                        + self.layer_info.num_effective_layers,
+                    )
+                )
+            )
+        int8_indexer_layer_ids = tuple(
+            sorted(
+                self.npu_int8_indexer_layer_ids(
+                    candidate_layer_ids=candidate_layer_ids,
+                    index_head_dim=(
+                        self.model_config.index_head_dim if is_dsa_model else None
+                    ),
+                )
+            )
+        )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -1976,6 +2032,7 @@ class KVCacheConfigurator:
             index_size=index_size,
             index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
+            int8_indexer_layer_ids=int8_indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype

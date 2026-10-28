@@ -157,5 +157,10 @@ This document provides a list of commonly used environment variables and aims to
       <td>Configures the network interface name for GLOO communication.</td>
       <td></td>
     </tr>
+    <tr>
+      <td><code>SGLANG_NPU_ENABLE_INT8_DSA_INDEXER</code></td>
+      <td>Store the DSA Lightning Indexer K cache as int8 with one fp16 scale per token, and score with <code>npu_quant_lightning_indexer</code> (DeepSeek-V3.2, GLM-5.x). With a ModelSlim checkpoint only the layers whose <code>indexer.quant_type</code> is <code>INT8_DYNAMIC</code> are quantized; MTP/draft layers stay bf16. See <a href="/docs/hardware-platforms/ascend-npus/optimization/quantization">Quantization on Ascend</a>.</td>
+      <td><code>False</code></td>
+    </tr>
   </tbody>
 </table>

@@ -1017,6 +1017,13 @@ class Envs:
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
+    # Store the DSA Lightning Indexer K cache as int8 with one fp16 scale per
+    # token and score with npu_quant_lightning_indexer (DeepSeek-V3.2, GLM-5.x).
+    # With a ModelSlim checkpoint only the layers whose indexer.quant_type is
+    # INT8_DYNAMIC are quantized; MTP/draft layers always stay bf16. Rejected
+    # together with an FP8 KV cache, --enable-hierarchical-cache,
+    # --enable-hisparse or SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.
+    SGLANG_NPU_ENABLE_INT8_DSA_INDEXER = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
