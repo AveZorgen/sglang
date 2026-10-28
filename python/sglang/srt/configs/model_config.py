@@ -1712,12 +1712,24 @@ class ModelConfig:
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
 
-    def _find_quant_modelslim_config(self):
-        if self.is_draft_model:
+    def _find_quant_modelslim_config(self, *, allow_draft: bool = False):
+        # Indexer cache selection also needs draft metadata, independently of
+        # whether draft weights use ModelSlim. Weight auto-detection keeps the
+        # default exclusion.
+        if self.is_draft_model and not allow_draft:
             return None
         quant_config_file = Path(self.model_path, "quant_model_description.json")
+        if allow_draft:
+            quant_config_file = cached_file(
+                self.model_path,
+                "quant_model_description.json",
+                revision=self.revision,
+                _raise_exceptions_for_missing_entries=False,
+            )
+        elif not quant_config_file.is_file():
+            return None
         quant_cfg = None
-        if quant_config_file.is_file():
+        if quant_config_file is not None:
             with open(quant_config_file) as f:
                 quant_cfg = json.load(f)
             # This field is required for flagless model loading but is not present in

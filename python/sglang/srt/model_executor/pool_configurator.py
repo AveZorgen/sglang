@@ -297,6 +297,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=draft_num_layers,
                         allocate_all_layers=True,
+                        is_draft=True,
                     )
                     draft_kv_size *= dcp_size
                     draft_indexer_size *= dcp_size
@@ -536,11 +537,35 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kvc: KVCacheConfigurator,
         num_layers: int,
         allocate_all_layers: bool = False,
+        is_draft: bool = False,
     ) -> int:
-        index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
+        size_int8_draft = (
+            _is_npu and is_draft and envs.SGLANG_NPU_ENABLE_INT8_DSA_INDEXER.get()
+        )
+        indexer_model_config = (
+            kvc.spec_aux_config.draft_model_config
+            if size_int8_draft
+            else kvc.model_config
+        )
+        if indexer_model_config is None:
+            raise ValueError("Draft indexer sizing requires the draft model config")
+        indexer_dtype = kvc.kv_cache_dtype
+        if size_int8_draft:
+            from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+            _, indexer_dtype = configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+                model=None,
+                model_dtype=indexer_model_config.dtype,
+                is_draft_worker=True,
+                is_dflash=False,
+                speculative_draft_attention_backend=get_spec().speculative_draft_attention_backend,
+                speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+            )
+        index_head_dim = get_dsa_index_head_dim(indexer_model_config.hf_config)
         indexer_size_per_token = ceil_div(
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
-            get_dsa_index_kpool(kvc.model_config.hf_config),
+            get_dsa_index_kpool(indexer_model_config.hf_config),
         )
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
@@ -548,7 +573,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-            dtype = kvc.kv_cache_dtype
+            dtype = indexer_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
@@ -607,8 +632,57 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
                 )
 
+        if _is_npu:
+            if is_draft:
+                int8_layers = kvc.npu_int8_indexer_layer_ids(
+                    candidate_layer_ids=tuple(range(num_layers)),
+                    index_head_dim=index_head_dim,
+                    model_config=indexer_model_config,
+                    kv_cache_dtype=indexer_dtype,
+                )
+                num_int8_layers = len(int8_layers)
+            else:
+                num_int8_layers = self._count_npu_int8_indexer_layers(
+                    kvc=kvc,
+                    index_head_dim=index_head_dim,
+                    all_layers=num_indexer_layers == num_layers,
+                )
+            if num_int8_layers:
+                from sglang.srt.hardware_backend.npu.dsa_int8_indexer import (
+                    npu_indexer_bytes_per_token,
+                )
+
+                # The GLM layer-shard branch sizes for its busiest rank; never
+                # count more INT8 layers than sized indexer layers.
+                return int(
+                    npu_indexer_bytes_per_token(
+                        num_indexer_layers=num_indexer_layers,
+                        num_int8_layers=min(num_int8_layers, num_indexer_layers),
+                        index_head_dim=index_head_dim,
+                        dense_element_size=element_size,
+                    )
+                    * indexer_ratio
+                )
+
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio
+        )
+
+    @staticmethod
+    def _count_npu_int8_indexer_layers(
+        *, kvc: KVCacheConfigurator, index_head_dim: int, all_layers: bool
+    ) -> int:
+        hf_config = kvc.model_config.hf_config
+        candidate_layer_ids = tuple(
+            layer_id
+            for layer_id in range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+            if all_layers or not dsa_layer_skips_topk(hf_config, layer_id)
+        )
+        return len(
+            kvc.npu_int8_indexer_layer_ids(
+                candidate_layer_ids=candidate_layer_ids,
+                index_head_dim=index_head_dim,
+            )
         )
 
     def calculate_pool_sizes(

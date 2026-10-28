@@ -39,18 +39,79 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_dtype):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.empty(x.shape[:-1], dtype=scale_dtype, device=x.device),
         )
     rotated = x @ hadamard
     quantized, scale = torch_npu.npu_dynamic_quant(
         rotated.reshape(-1, 128), dst_type=dst_type
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    return quantized.reshape(x.shape), scale.to(scale_dtype).reshape(x.shape[:-1])
+
+
+def _npu_lightning_indexer_topk(
+    *,
+    query,
+    key,
+    weights,
+    actual_seq_lengths_query,
+    actual_seq_lengths_key,
+    block_table,
+    sparse_count,
+    quant_dtype,
+    pool,
+    layer_id,
+):
+    """Top-k token indices shaped [T, 1, K], quantizing the query when the layer's
+    indexer cache is quantized."""
+    if quant_dtype is None:
+        return torch_npu.npu_lightning_indexer(
+            query=query,
+            key=key,
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=sparse_count,
+            sparse_mode=3,
+        )[0]
+
+    query, query_scale = _quantize_npu_indexer_activation(
+        query,
+        pool.indexer_hadamard_128,
+        quant_dtype,
+        pool.get_index_k_scale_buffer(layer_id).dtype,
+    )
+    quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
+    if quant_dtype == torch.int8:
+        # The A2/A3 int8 kernel takes fp16 head weights alongside fp16 scales.
+        weights = weights.to(torch.float16)
+        # `import custom_ops` rebinds torch_npu.npu_quant_lightning_indexer to
+        # the sgl-kernel-npu op, which rejects int8 caches; torch.ops.npu keeps
+        # the original torch_npu kernel.
+        quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
+    return quant_lightning_indexer(
+        query=query,
+        key=key,
+        weights=weights,
+        query_dequant_scale=query_scale,
+        key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_key=actual_seq_lengths_key,
+        block_table=block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=sparse_count,
+        sparse_mode=3,
+        query_quant_mode=0,
+        key_quant_mode=0,
+    )
 
 
 class DSANPUIndexerMixin:
@@ -226,10 +287,13 @@ class DSANPUIndexerMixin:
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
         pool = get_token_to_kv_pool()
-        use_quant_indexer = pool.index_k_scale_buffer is not None
-        if use_quant_indexer:
+        index_quant_dtype = pool.get_index_k_quant_dtype(layer_id)
+        if index_quant_dtype is not None:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k,
+                pool.indexer_hadamard_128,
+                index_quant_dtype,
+                pool.get_index_k_scale_buffer(layer_id).dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -316,6 +380,8 @@ class DSANPUIndexerMixin:
                 actual_seq_lengths_q,
                 actual_seq_lengths_kv,
                 block_table,
+                quant_dtype=index_quant_dtype,
+                layer_id=layer_id,
             )
             return topk_indices
         else:
@@ -325,48 +391,22 @@ class DSANPUIndexerMixin:
                 else block_table
             )
 
-            if use_quant_indexer:
-                query, query_scale = _quantize_npu_indexer_activation(
-                    q.view(-1, self.n_heads, self.head_dim),
-                    pool.indexer_hadamard_128,
-                    pool.dtype,
-                )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
-                    ),
-                    block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                )
-                return topk_indices.squeeze(1)
-
-            topk_indices = torch_npu.npu_lightning_indexer(
+            topk_indices = _npu_lightning_indexer_topk(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                    torch.int32
+                actual_seq_lengths_key=actual_seq_lengths_kv.to(
+                    device=k.device, dtype=torch.int32
                 ),
                 block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
                 sparse_count=self.index_topk,
-                sparse_mode=3,
+                quant_dtype=index_quant_dtype,
+                pool=pool,
+                layer_id=layer_id,
             )
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices[0].squeeze(1)
+            return topk_indices.squeeze(1)
 
     def do_npu_cp_balance_indexer(
         self,
@@ -376,6 +416,9 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
         block_table,
+        *,
+        quant_dtype,
+        layer_id,
     ):
         q_prev, q_next = torch.split(q, (q.size(0) + 1) // 2, dim=0)
         weights_prev, weights_next = None, None
@@ -389,7 +432,8 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        topk_indices_prev = torch_npu.npu_lightning_indexer(
+        pool = get_token_to_kv_pool()
+        topk_indices_prev = _npu_lightning_indexer_topk(
             query=q_prev,
             key=past_key_states,
             weights=weights_prev,
@@ -400,12 +444,12 @@ class DSANPUIndexerMixin:
                 device=q.device, dtype=torch.int32
             ),
             block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
             sparse_count=self.index_topk,
-            sparse_mode=3,
+            quant_dtype=quant_dtype,
+            pool=pool,
+            layer_id=layer_id,
         )
-        topk_indices_next = torch_npu.npu_lightning_indexer(
+        topk_indices_next = _npu_lightning_indexer_topk(
             query=q_next,
             key=past_key_states,
             weights=weights_next,
@@ -416,12 +460,12 @@ class DSANPUIndexerMixin:
                 device=q.device, dtype=torch.int32
             ),
             block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
             sparse_count=self.index_topk,
-            sparse_mode=3,
+            quant_dtype=quant_dtype,
+            pool=pool,
+            layer_id=layer_id,
         )
-        return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
+        return torch.cat([topk_indices_prev, topk_indices_next], dim=0).squeeze(1)
 
 
 def scattered_to_tp_attn_full(
