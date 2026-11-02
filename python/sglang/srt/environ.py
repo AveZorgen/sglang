@@ -1146,6 +1146,8 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    # ModelSlim indexer.quant_type selects INT8 cache layers. MTP/speculative
+    # decoding and unsupported cache/parallelism combinations are rejected.
     SGLANG_NPU_INDEXER_INT8 = EnvBool(False)
     # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
     SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
