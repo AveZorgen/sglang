@@ -57,6 +57,8 @@ def resolve_npu_int8_indexer_layer_ids(
     enable_speculative_decoding: bool = False,
     enable_prefill_cp: bool = False,
     enable_pp_disaggregation: bool = False,
+    enable_decode_kv_offload: bool = False,
+    enable_decode_host_backup: bool = False,
 ) -> frozenset[int]:
     """Indexer layers on this rank whose K cache is stored as INT8.
 
@@ -84,6 +86,11 @@ def resolve_npu_int8_indexer_layer_ids(
             ("prefill context parallelism", enable_prefill_cp),
             ("pipeline-parallel PD disaggregation", enable_pp_disaggregation),
             ("--enable-hierarchical-cache", enable_hierarchical_cache),
+            ("--disaggregation-decode-enable-offload-kvcache", enable_decode_kv_offload),
+            (
+                "--disaggregation-decode-retraction-backup=host_pool",
+                enable_decode_host_backup,
+            ),
             ("--enable-hisparse", enable_hisparse),
             ("SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD", enable_sparse_kv_offload),
         )

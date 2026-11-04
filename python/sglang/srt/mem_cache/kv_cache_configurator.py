@@ -2222,18 +2222,29 @@ class KVCacheConfigurator:
         )
 
         enable_int8_indexer = envs.SGLANG_NPU_INDEXER_INT8.get()
-        quant_description = (
-            self.model_config._find_quant_modelslim_config()
-            if enable_int8_indexer
-            else None
-        )
+        quant_description = None
+        if enable_int8_indexer:
+            # The weight loader resolves remote checkpoint metadata too; the
+            # ModelConfig lookup below only knows about local model paths.
+            quant_description = getattr(
+                getattr(self.model, "quant_config", None), "quant_description", None
+            )
+            if quant_description is None:
+                quant_description = self.model_config._find_quant_modelslim_config()
         memory_config = get_memory()
+        disagg_config = get_disagg()
         return resolve_npu_int8_indexer_layer_ids(
             enable_int8_indexer=enable_int8_indexer,
             is_npu=_is_npu,
             index_head_dim=index_head_dim,
             kv_cache_is_fp8=self.kv_cache_dtype == torch.float8_e4m3fn,
             enable_hierarchical_cache=memory_config.enable_hierarchical_cache,
+            enable_decode_kv_offload=(
+                disagg_config.disaggregation_decode_enable_offload_kvcache
+            ),
+            enable_decode_host_backup=(
+                disagg_config.disaggregation_decode_retraction_backup == "host_pool"
+            ),
             enable_hisparse=memory_config.enable_hisparse,
             enable_sparse_kv_offload=envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get(),
             enable_speculative_decoding=(
@@ -2241,7 +2252,7 @@ class KVCacheConfigurator:
             ),
             enable_prefill_cp=get_parallel().attn_cp_size > 1,
             enable_pp_disaggregation=(
-                self.pp_size > 1 and get_disagg().disaggregation_mode != "null"
+                self.pp_size > 1 and disagg_config.disaggregation_mode != "null"
             ),
             candidate_layer_ids=candidate_layer_ids,
             modelslim_quant_description=quant_description,

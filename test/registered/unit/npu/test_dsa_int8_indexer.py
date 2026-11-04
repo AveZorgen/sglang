@@ -118,6 +118,8 @@ class TestResolveNpuInt8IndexerLayerIds(unittest.TestCase):
             "prefill cp": dict(enable_prefill_cp=True),
             "pp disaggregation": dict(enable_pp_disaggregation=True),
             "hicache": dict(enable_hierarchical_cache=True),
+            "decode kv offload": dict(enable_decode_kv_offload=True),
+            "decode host backup": dict(enable_decode_host_backup=True),
             "hisparse": dict(enable_hisparse=True),
             "sparse offload": dict(enable_sparse_kv_offload=True),
         }
