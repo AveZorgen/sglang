@@ -2217,24 +2217,23 @@ class KVCacheConfigurator:
         self, *, candidate_layer_ids: tuple[int, ...], index_head_dim: Optional[int]
     ) -> frozenset[int]:
         """Indexer layers whose K cache the NPU pool stores as INT8."""
+        if not envs.SGLANG_NPU_INDEXER_INT8.get():
+            return frozenset()
+
         from sglang.srt.hardware_backend.npu.dsa_int8_indexer import (
             resolve_npu_int8_indexer_layer_ids,
         )
 
-        enable_int8_indexer = envs.SGLANG_NPU_INDEXER_INT8.get()
-        quant_description = None
-        if enable_int8_indexer:
-            # The weight loader resolves remote checkpoint metadata too; the
-            # ModelConfig lookup below only knows about local model paths.
-            quant_description = getattr(
-                getattr(self.model, "quant_config", None), "quant_description", None
-            )
-            if quant_description is None:
-                quant_description = self.model_config._find_quant_modelslim_config()
+        # The weight loader resolves remote checkpoint metadata too; the
+        # ModelConfig lookup below only knows about local model paths.
+        quant_description = getattr(
+            getattr(self.model, "quant_config", None), "quant_description", None
+        )
+        if quant_description is None:
+            quant_description = self.model_config._find_quant_modelslim_config()
         memory_config = get_memory()
         disagg_config = get_disagg()
         return resolve_npu_int8_indexer_layer_ids(
-            enable_int8_indexer=enable_int8_indexer,
             is_npu=_is_npu,
             index_head_dim=index_head_dim,
             kv_cache_is_fp8=self.kv_cache_dtype == torch.float8_e4m3fn,

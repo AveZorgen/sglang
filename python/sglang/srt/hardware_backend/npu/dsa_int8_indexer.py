@@ -45,7 +45,6 @@ def parse_modelslim_int8_indexer_layers(
 
 def resolve_npu_int8_indexer_layer_ids(
     *,
-    enable_int8_indexer: bool,
     is_npu: bool,
     index_head_dim: Optional[int],
     kv_cache_is_fp8: bool,
@@ -60,14 +59,11 @@ def resolve_npu_int8_indexer_layer_ids(
     enable_decode_kv_offload: bool = False,
     enable_decode_host_backup: bool = False,
 ) -> frozenset[int]:
-    """Indexer layers on this rank whose K cache is stored as INT8.
+    """Resolve INT8 indexer layers after the caller checks SGLANG_NPU_INDEXER_INT8.
 
     ``candidate_layer_ids`` are the indexer layers the pool allocates on this
     rank. Speculative decoding, including MTP, is not supported yet.
     """
-    if not enable_int8_indexer:
-        return frozenset()
-
     if not is_npu:
         raise ValueError(f"{_FLAG} is only supported on Ascend NPU.")
     if index_head_dim is None:
@@ -86,7 +82,10 @@ def resolve_npu_int8_indexer_layer_ids(
             ("prefill context parallelism", enable_prefill_cp),
             ("pipeline-parallel PD disaggregation", enable_pp_disaggregation),
             ("--enable-hierarchical-cache", enable_hierarchical_cache),
-            ("--disaggregation-decode-enable-offload-kvcache", enable_decode_kv_offload),
+            (
+                "--disaggregation-decode-enable-offload-kvcache",
+                enable_decode_kv_offload,
+            ),
             (
                 "--disaggregation-decode-retraction-backup=host_pool",
                 enable_decode_host_backup,

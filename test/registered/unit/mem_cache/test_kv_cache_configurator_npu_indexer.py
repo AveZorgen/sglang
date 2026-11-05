@@ -13,6 +13,21 @@ register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
 
 class TestNPUIndexerLayerLayout(CustomTestCase):
+    def test_disabled_int8_indexer_needs_no_model_or_runtime_configuration(self):
+        configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        with (
+            patch.object(kcc.envs.SGLANG_NPU_INDEXER_INT8, "get", return_value=False),
+            patch.object(kcc, "get_memory", side_effect=AssertionError("get_memory")),
+            patch.object(kcc, "get_disagg", side_effect=AssertionError("get_disagg")),
+            patch.object(
+                kcc, "get_parallel", side_effect=AssertionError("get_parallel")
+            ),
+        ):
+            result = configurator.npu_int8_indexer_layer_ids(
+                candidate_layer_ids=(0, 1, 2), index_head_dim=128
+            )
+        self.assertEqual(result, frozenset())
+
     def _resolve_int8_layers(self, description=None, **disagg_overrides):
         configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         configurator.model = SimpleNamespace(
@@ -108,6 +123,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         pool = object()
 
         with (
+            patch.object(kcc.envs.SGLANG_NPU_INDEXER_INT8, "get", return_value=False),
             patch.object(
                 kcc,
                 "get_parallel",
@@ -149,6 +165,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         self.assertEqual(pool_class.call_args.args, (64,))
         self.assertEqual(pool_class.call_args.kwargs["index_size"], 128)
         self.assertEqual(pool_class.call_args.kwargs["indexer_layer_ids"], (10, 12))
+        self.assertEqual(pool_class.call_args.kwargs["int8_indexer_layer_ids"], ())
 
 
 if __name__ == "__main__":

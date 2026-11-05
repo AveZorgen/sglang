@@ -15,7 +15,6 @@ def _indexer_key(layer_id: int, suffix: str = "quant_type") -> str:
 
 def _resolve(**overrides):
     kwargs = dict(
-        enable_int8_indexer=True,
         is_npu=True,
         index_head_dim=128,
         kv_cache_is_fp8=False,
@@ -73,17 +72,6 @@ class TestParseModelSlimInt8IndexerLayers(unittest.TestCase):
 
 
 class TestResolveNpuInt8IndexerLayerIds(unittest.TestCase):
-    def test_disabled_returns_empty(self):
-        self.assertEqual(
-            _resolve(
-                enable_int8_indexer=False,
-                enable_speculative_decoding=True,
-                is_npu=False,
-                index_head_dim=None,
-            ),
-            frozenset(),
-        )
-
     def test_all_candidates_without_modelslim_metadata(self):
         self.assertEqual(_resolve(), frozenset(range(8)))
 
