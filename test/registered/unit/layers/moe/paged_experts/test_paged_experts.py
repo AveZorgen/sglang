@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.npu.moe.paged_experts import AscendRunnerContract
 from sglang.srt.layers.moe.paged_experts import (
     PagedExpertsMoEMethod,
     disk_tier,
@@ -485,6 +486,37 @@ def _combining_layer(contract=None, partial_dtype=None):
 
     method.base_method.apply = combining_apply
     return method, layer, full, calls
+
+
+class TestAscendContract(CustomTestCase):
+    def test_runner_config(self):
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+        contract = AscendRunnerContract()
+        config = contract.runner_config(MoeRunnerConfig(num_experts=E), K)
+        self.assertTrue(contract.combines)
+        self.assertFalse(contract.drops_outside)
+        self.assertEqual(config.num_experts, K)
+        self.assertEqual(config.num_local_experts, K)
+        self.assertFalse(config.no_combine)
+
+    def test_rejects_graphs_and_nz_weights_at_startup(self):
+        """The contract refuses, before the checkpoint loads, what the MVP cannot serve:
+        CUDA graphs (no device-side wave planning) and NZ weights (the host store must
+        equal the GPU rows verbatim)."""
+        module = "sglang.srt.hardware_backend.npu.moe.paged_experts."
+        with patch(module + "cuda_graph_fully_disabled", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "--disable-cuda-graph"):
+                AscendRunnerContract().validate()
+        with patch(module + "cuda_graph_fully_disabled", return_value=True):
+            with patch.dict(os.environ):
+                os.environ.pop("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", None)
+                with self.assertRaisesRegex(
+                    RuntimeError, "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"
+                ):
+                    AscendRunnerContract().validate()
+            with patch.dict(os.environ, {"SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1"}):
+                AscendRunnerContract().validate()  # accepted: eager, ND weights
 
 
 class TestCombiningRunner(CustomTestCase):
