@@ -44,6 +44,7 @@ def gather_rows(
         expert = tl.load(src + copy)
         slot = tl.load(dst + copy)
         host = tl.load(host_address).to(tl.pointer_type(tl.int32))
+        slots = slots.to(tl.pointer_type(tl.int32))
         words = tl.program_id(0) * block_words + tl.arange(0, block_words)
         data = tl.load(host + expert.to(tl.int64) * row_words + words)
         tl.store(slots + slot.to(tl.int64) * row_words + words, data)
@@ -79,7 +80,7 @@ def acl_call(function, *arguments):
 
 
 @contextmanager
-def mapped_host_buffer(acl, byte_count, generator):
+def mapped_host_buffer(acl, byte_count):
     allocation = ctypes.c_void_p()
     acl_call(
         acl.aclrtMallocHost, ctypes.byref(allocation), byte_count + _HOST_ALIGNMENT - 1
@@ -102,8 +103,7 @@ def mapped_host_buffer(acl, byte_count, generator):
         if mapped.value is None:
             raise RuntimeError("aclrtHostGetDevicePointer returned a null pointer")
         data = (ctypes.c_int32 * (byte_count // _WORD_BYTES)).from_address(host)
-        torch.frombuffer(data, dtype=torch.int32).random_(generator=generator)
-        yield host, mapped.value
+        yield torch.frombuffer(data, dtype=torch.int32), mapped.value
     finally:
         if registered:
             torch.npu.synchronize()
@@ -150,9 +150,10 @@ def probe(args, acl):
         mapped_addresses = {}
         for name, row_bytes in _ROW_BYTES.items():
             host, mapped = resources.enter_context(
-                mapped_host_buffer(acl, expert_count * row_bytes, generator)
+                mapped_host_buffer(acl, expert_count * row_bytes)
             )
-            host_addresses[name] = host
+            host.random_(generator=generator)
+            host_addresses[name] = host.data_ptr()
             mapped_addresses[name] = torch.tensor(
                 [mapped], dtype=torch.int64, device=args.device
             )
