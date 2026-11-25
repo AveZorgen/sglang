@@ -145,6 +145,9 @@ class DeviceExecutor:
     def bind(self, layer):
         self.store.bind(layer, device_planned=True)
 
+    def can_run(self):
+        return True
+
     def prepare_routes(self, topk_ids, topk_weights):
         from sglang.kernels.ops.moe.paged_experts import paged_experts_decide
 
@@ -177,7 +180,7 @@ class DeviceExecutor:
         run_ids, run_w = self.prepare_routes(
             topk_output.topk_ids, topk_output.topk_weights
         )
-        # Every valid expert ID is resident. Invalid IDs map to slot 0 with weight 0.
+        # Every routed expert is now resident; padding got slot 0 and weight 0.
         wave_output = dispatch_output._replace(
             topk_output=topk_output._replace(topk_ids=run_ids, topk_weights=run_w)
         )

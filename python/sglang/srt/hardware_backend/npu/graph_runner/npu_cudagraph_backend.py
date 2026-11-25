@@ -35,7 +35,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -66,6 +66,11 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
+        self._paged_experts_live_tokens = (
+            torch.empty(1, dtype=torch.int32, device=f"npu:{self._device_id}")
+            if get_exec().moe.enable_paged_experts
+            else None
+        )
         self._tp_group = get_parallel().tp_group
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -411,7 +416,15 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             if self._decode_runner.model_runner.is_draft_worker
             else empty_context()
         )
-        with record_ctx:
+        live = self._paged_experts_live_tokens
+        if live is not None:
+            live.fill_(shape_key.size)
+        route_ctx = (
+            get_forward().scoped(paged_experts_live_tokens=live)
+            if live is not None
+            else empty_context()
+        )
+        with record_ctx, route_ctx:
             self._capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
 
     def _capture_one(
@@ -471,6 +484,8 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         **kwargs,
     ) -> Any:
         runner = self._decode_runner
+        if self._paged_experts_live_tokens is not None:
+            self._paged_experts_live_tokens.fill_(runner.raw_num_token)
         if runner is not None:
             from sglang.srt.speculative import (
                 multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,

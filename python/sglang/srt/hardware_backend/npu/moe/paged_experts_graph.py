@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor
+from sglang.srt.runtime_context import get_forward
 
 _BLOCK_WORDS = 4096
 _HOST_ALIGNMENT = 64 * 1024
@@ -122,6 +123,7 @@ def mapped_host_alloc(shape, dtype):
 def plan_residency(
     ids,
     weights,
+    live_tokens,
     slot_expert,
     expert_slot,
     last_use,
@@ -134,6 +136,7 @@ def plan_residency(
     routes: tl.constexpr,
     slots: tl.constexpr,
     experts: tl.constexpr,
+    top_k: tl.constexpr,
     slot_block: tl.constexpr,
 ):
     slot_ids = tl.arange(0, slot_block)
@@ -141,17 +144,18 @@ def plan_residency(
     resident = tl.load(slot_expert + slot_ids, mask=active, other=-1)
     ages = tl.load(last_use + slot_ids, mask=active, other=2147483647)
     now = tl.load(step) + 1
+    live_routes = tl.load(live_tokens) * top_k
     # Protect every requested resident before assigning any misses.
     for route in range(routes):
         expert = tl.load(ids + route)
-        valid = (expert >= 0) & (expert < experts)
+        valid = (route < live_routes) & (expert >= 0) & (expert < experts)
         ages = tl.where(valid & (resident == expert), now, ages)
     tl.store(last_use + slot_ids, ages, mask=active)
 
     misses = 0
     for route in range(routes):
         expert = tl.load(ids + route)
-        valid = (expert >= 0) & (expert < experts)
+        valid = (route < live_routes) & (expert >= 0) & (expert < experts)
         slot = 0
         weight = 0.0
         if valid:
@@ -202,6 +206,9 @@ class AscendDeviceExecutor(DeviceExecutor):
             )
             self.transfers.append((address, words, row_words, block))
 
+    def can_run(self):
+        return get_forward().paged_experts_live_tokens is not None
+
     def prepare_routes(self, topk_ids, topk_weights):
         r = self.residency
         slots = r.slot_expert.numel()
@@ -212,6 +219,7 @@ class AscendDeviceExecutor(DeviceExecutor):
         plan_residency[(1,)](
             topk_ids.int().contiguous(),
             topk_weights.contiguous(),
+            get_forward().paged_experts_live_tokens,
             r.slot_expert,
             r.expert_slot,
             r.slot_lastuse,
@@ -224,6 +232,7 @@ class AscendDeviceExecutor(DeviceExecutor):
             topk_ids.numel(),
             slots,
             r.expert_slot.numel(),
+            topk_ids.shape[-1],
             triton.next_power_of_2(slots),
         )
         for address, words, row_words, block in self.transfers:

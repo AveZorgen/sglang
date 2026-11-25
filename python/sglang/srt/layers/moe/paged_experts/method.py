@@ -376,6 +376,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         if (
             self.device_executor is not None
             and topk_output.topk_ids.numel() <= self.num_resident
+            and self.device_executor.can_run()
             # A breakable graph cannot replay for a disk read: those steps run as a break.
             and not (self.tiered and is_in_breakable_cuda_graph())
         ):

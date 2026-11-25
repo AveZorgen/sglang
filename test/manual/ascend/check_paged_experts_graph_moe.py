@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.moe.paged_experts_graph import (
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.runtime_context import get_forward
 
 _EXPERTS = 6
 _HIDDEN = 2048
@@ -73,6 +74,7 @@ def finish_graph(graph):
 def capture_decode(resources, layer, hidden, weights, method):
     device = hidden.device
     ids = torch.tensor([[0, 1]] * len(hidden), dtype=torch.int32, device=device)
+    live = torch.full((1,), len(hidden), dtype=torch.int32, device=device)
     dispatch = StandardDispatchOutput(
         hidden,
         None,
@@ -80,7 +82,8 @@ def capture_decode(resources, layer, hidden, weights, method):
     )
 
     def forward():
-        return method.apply(layer, dispatch).hidden_states * _ROUTED_SCALE
+        with get_forward().scoped(paged_experts_live_tokens=live):
+            return method.apply(layer, dispatch).hidden_states * _ROUTED_SCALE
 
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
@@ -93,7 +96,7 @@ def capture_decode(resources, layer, hidden, weights, method):
     with torch.npu.graph(graph, stream=stream, auto_dispatch_capture=True):
         output = forward()
     torch.npu.current_stream().wait_stream(stream)
-    return graph, ids, output
+    return graph, ids, live, output
 
 
 def check_output(label, actual, expected):
@@ -163,8 +166,9 @@ def run_cases(device, slots):
         def replay(case, routes, misses, live=None):
             bs = len(routes)
             live = bs if live is None else live
-            graph, ids, output = graphs[bs]
+            graph, ids, live_tokens, output = graphs[bs]
             ids.copy_(torch.tensor(routes, dtype=ids.dtype))
+            live_tokens.fill_(live)
             torch.npu.synchronize()
             graph.replay()
             actual_misses = state.count.item()
@@ -173,6 +177,8 @@ def run_cases(device, slots):
             )
             expected = run_moe(unpaged, hidden[:live], ids[:live], weights[:live])
             error = check_output(case, output[:live], expected * _ROUTED_SCALE)
+            if live < bs:
+                assert output[live:].cpu().count_nonzero().item() == 0, case
             resident = check_residency(case, state, layer, store)
             print(
                 f"{case}: misses={misses}, slots={resident}, max_abs_error={error:g}",
@@ -192,6 +198,7 @@ def run_cases(device, slots):
 
         replay("K=4 shared miss", [[0, 4], [2, 4]], 1)
         replay("K=4 shape switch", [[2, 3], [4, 5]], 2)
+        replay("K=4 padded row", [[2, 3], [0, 1]], 0, live=1)
         ids = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32, device=device)
         dispatch = StandardDispatchOutput(
             hidden,
@@ -208,8 +215,6 @@ def run_cases(device, slots):
         )
         replay("K=4 replay after eager", [[0, 1]], 0)
         replay("K=4 second shape after eager", [[2, 3], [4, 5]], 2)
-        # Only the first output row is consumed. Both valid padding IDs page in.
-        replay("K=4 padded row", [[2, 3], [0, 1]], 2, live=1)
 
 
 @torch.inference_mode()

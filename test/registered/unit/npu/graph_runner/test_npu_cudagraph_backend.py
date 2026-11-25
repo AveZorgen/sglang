@@ -36,6 +36,13 @@ def _make_backend(runner=None):
         )
     with (
         get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+        mock.patch.object(
+            mod,
+            "get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(enable_paged_experts=False)
+            ),
+        ),
         mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
     ):
         return mod.NPUCudaGraphBackend(runner), runner
@@ -89,6 +96,29 @@ def _make_decode_runner(raw_bs=2, bs=2):
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):
+    def test_paged_experts_capture_and_padded_replay_share_live_count(self):
+        runner = _make_decode_runner(raw_bs=2, bs=4)
+        runner.raw_num_token = 2
+        runner.model_runner.is_draft_worker = False
+        backend, _ = _make_backend(runner)
+        self.addCleanup(backend.cleanup)
+        live = backend._paged_experts_live_tokens = torch.zeros(1, dtype=torch.int32)
+        key = ShapeKey(size=4)
+
+        def capture(*args):
+            self.assertIs(mod.get_forward().paged_experts_live_tokens, live)
+            self.assertEqual(live.item(), 4)
+
+        with mock.patch.object(backend, "_capture_one", side_effect=capture):
+            backend.capture_one(key, mock.Mock())
+        self.assertIsNone(mod.get_forward().paged_experts_live_tokens)
+        with (
+            mock.patch.object(backend, "replay_with_input_update"),
+            mock.patch.object(backend, "_decode_update_lengths"),
+        ):
+            backend.replay(key, mock.Mock())
+        self.assertEqual(live.item(), 2)
+
     def test_replay_update_converts_legacy_sequence_lengths_to_int32_tensor(self):
         backend, runner = _make_backend()
         graph = mock.Mock()
