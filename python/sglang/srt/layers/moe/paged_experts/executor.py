@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.paged_experts.residency import (
 )
 from sglang.srt.layers.moe.paged_experts.runners import RunnerContract, run_on_slots
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+from sglang.srt.utils.device import is_device_stream_capturing
 
 
 class EagerExecutor:
@@ -46,7 +47,7 @@ class EagerExecutor:
 
     def run(self, layer, dispatch_output):
         r = self.device_residency
-        if r is not None and torch.cuda.is_current_stream_capturing():
+        if r is not None and is_device_stream_capturing(r.step.device):
             raise RuntimeError(
                 "Paged experts: a captured decode batch routes more entries than the K "
                 "resident slots; capture batch sizes must stay at or below K // top_k"
@@ -141,13 +142,13 @@ class DeviceExecutor:
         self.contract = contract
         self.routed_scaling_factor = routed_scaling_factor
 
-    def run(self, layer, dispatch_output):
+    def bind(self, layer):
+        self.store.bind(layer, device_planned=True)
+
+    def prepare_routes(self, topk_ids, topk_weights):
         from sglang.kernels.ops.moe.paged_experts import paged_experts_decide
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         r = self.residency
-        topk_output = dispatch_output.topk_output
-        topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
         run_ids = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
         run_w = torch.empty(topk_ids.shape, dtype=torch.float32, device=topk_ids.device)
         paged_experts_decide(
@@ -167,11 +168,18 @@ class DeviceExecutor:
         if not torch.cuda.is_current_stream_capturing():
             # Not a graph replay: page in what the gather left on disk before the GEMM.
             self.store.resolve_pending()
-        # Every routed expert is now resident; padding got slot 0 and weight 0.
+        return run_ids, run_w.to(topk_weights.dtype)
+
+    def run(self, layer, dispatch_output):
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        topk_output = dispatch_output.topk_output
+        run_ids, run_w = self.prepare_routes(
+            topk_output.topk_ids, topk_output.topk_weights
+        )
+        # Every valid expert ID is resident. Invalid IDs map to slot 0 with weight 0.
         wave_output = dispatch_output._replace(
-            topk_output=topk_output._replace(
-                topk_ids=run_ids, topk_weights=run_w.to(topk_weights.dtype)
-            )
+            topk_output=topk_output._replace(topk_ids=run_ids, topk_weights=run_w)
         )
         partial = self.base_method.apply(
             layer=layer, dispatch_output=wave_output

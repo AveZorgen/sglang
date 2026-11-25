@@ -16,18 +16,30 @@ from dataclasses import replace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.paged_experts.formats import UnquantizedFormat
 from sglang.srt.layers.moe.paged_experts.runners import (
     RunnerContract,
     register_runner_contract,
     run_on_slots,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
+)
 
 
 def _ascend_host_alloc(shape, dtype: torch.dtype) -> torch.Tensor:
-    """Pinned host memory through torch's pinned allocator, the NPU selection of
-    ``ALLOC_MEMORY_FUNCS`` (the memfd + cudaHostRegister default is CUDA-only)."""
+    """Allocate mapped rows for graph page-in, or torch-pinned rows for eager copies."""
+    if not cuda_graph_fully_disabled():
+        from sglang.srt.hardware_backend.npu.moe.paged_experts_graph import (
+            mapped_host_alloc,
+        )
+
+        return mapped_host_alloc(shape, dtype)
+
     from sglang.srt.mem_cache.pool_host.common import alloc_with_pin_memory
 
     return alloc_with_pin_memory(
@@ -50,11 +62,24 @@ class AscendRunnerContract(RunnerContract):
             no_combine_keep_router_weight=False,
         )
 
-    def validate(self) -> None:
-        if not cuda_graph_fully_disabled():
+    def make_device_executor(self, **kwargs):
+        from sglang.srt.hardware_backend.npu.moe.paged_experts_graph import (
+            AscendDeviceExecutor,
+        )
+
+        return AscendDeviceExecutor(contract=self, **kwargs)
+
+    def validate(self, method) -> None:
+        if method.graphs and not (
+            check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+            and not method.auto_size
+            and isinstance(method.format, UnquantizedFormat)
+            and method.params_dtype == torch.bfloat16
+        ):
             raise RuntimeError(
-                "Paged experts on Ascend: CUDA graphs are not supported yet; run with "
-                "--disable-cuda-graph (every step takes the host-planned eager path)"
+                "Paged experts on Ascend: graphs require full decode, disabled prefill graphs, "
+                "an explicit --paged-experts-num-resident, and unquantized BF16 weights"
             )
         if not envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
             raise RuntimeError(
