@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.paged_experts.disk_tier import (
     host_rows,
     tier_cache,
 )
-from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
+from sglang.srt.layers.moe.paged_experts.executor import EagerExecutor
 from sglang.srt.layers.moe.paged_experts.expert_cache import ExpertCache, fill_store
 from sglang.srt.layers.moe.paged_experts.formats import (
     FORMATS,
@@ -189,7 +189,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self.moe_runner_config = moe_runner_config  # rebuilt with the final K
         self._create_runner(layer)  # provisional: the shared paged config
         self.contract = contract_for(self.runner)
-        self.contract.validate()
+        self.contract.validate(self)
         if self._runner_config() != runner_config(moe_runner_config, self.num_resident):
             # The contract configures the runner differently (e.g. its slot ids are the
             # expert ids, so its tables are K wide): rebuild with that config.
@@ -342,7 +342,6 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def _build(self, layer):
         """The executors and, with CUDA graphs, the device residency, for the final K."""
         self.policy = LRUPolicy(self.num_resident)
-        self.store.bind(layer, device_planned=self.graphs)
         residency = None
         if self.graphs:
             residency = DeviceResidency(
@@ -350,13 +349,15 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 num_slots=self.num_resident,
                 device=getattr(layer, next(iter(self.store.host))).device,
             )
-            self.device_executor = DeviceExecutor(
+            self.device_executor = self.contract.make_device_executor(
                 base_method=self.format.runner_method(self.base_method),
                 store=self.store,
                 residency=residency,
-                contract=self.contract,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
+            self.device_executor.bind(layer)
+        else:
+            self.store.bind(layer, device_planned=False)
         self.executor = EagerExecutor(
             base_method=self.format.runner_method(self.base_method),
             store=self.store,
@@ -370,11 +371,12 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def apply(self, layer, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        # Decided from shapes alone, so a captured graph always takes the same path.
+        # Only the padded route shape determines whether a captured step fits one wave.
         topk_output = dispatch_output.topk_output
         if (
             self.device_executor is not None
             and topk_output.topk_ids.numel() <= self.num_resident
+            and self.device_executor.can_run()
             # A breakable graph cannot replay for a disk read: those steps run as a break.
             and not (self.tiered and is_in_breakable_cuda_graph())
         ):

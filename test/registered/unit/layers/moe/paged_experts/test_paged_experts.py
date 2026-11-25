@@ -220,7 +220,7 @@ def _create(method, layer, contract, moe_runner_config=None):
         patch(_METHOD + "contract_for", return_value=contract),
         patch(_METHOD + "host_rows", side_effect=lambda rows, e, *a, **k: e),
         patch(_METHOD + "get_exec", return_value=_exec()),
-        patch.object(contract, "validate", lambda: None),
+        patch.object(contract, "validate", lambda method: None),
     ):
         method.create_weights(
             layer=layer,
@@ -532,23 +532,42 @@ class TestAscendContract(CustomTestCase):
                 else:
                     self.assertEqual(method.base_method.rows, entries)
 
-    def test_rejects_graphs_and_nz_weights_at_startup(self):
-        """The contract refuses, before the checkpoint loads, what the MVP cannot serve:
-        CUDA graphs (no device-side wave planning) and NZ weights (the host store must
-        equal the GPU rows verbatim)."""
-        module = "sglang.srt.hardware_backend.npu.moe.paged_experts."
-        with patch(module + "cuda_graph_fully_disabled", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "--disable-cuda-graph"):
-                AscendRunnerContract().validate()
-        with patch(module + "cuda_graph_fully_disabled", return_value=True):
-            with patch.dict(os.environ):
-                os.environ.pop("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", None)
-                with self.assertRaisesRegex(
-                    RuntimeError, "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"
+    def test_ascend_graph_configuration(self):
+        check = (
+            "sglang.srt.hardware_backend.npu.moe.paged_experts.check_cuda_graph_backend"
+        )
+        contract = AscendRunnerContract()
+        method = SimpleNamespace(
+            graphs=True,
+            auto_size=False,
+            format=UnquantizedFormat(),
+            params_dtype=torch.bfloat16,
+        )
+        with patch.dict(os.environ, {"SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1"}):
+            with patch(check, return_value=True):
+                contract.validate(method)
+                for field, value in (
+                    ("auto_size", True),
+                    ("params_dtype", torch.float16),
+                    ("format", None),
                 ):
-                    AscendRunnerContract().validate()
-            with patch.dict(os.environ, {"SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1"}):
-                AscendRunnerContract().validate()  # accepted: eager, ND weights
+                    with self.subTest(field=field), patch.object(method, field, value):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "explicit.*unquantized BF16"
+                        ):
+                            contract.validate(method)
+            for modes in ((False,), (True, False)):
+                with (
+                    patch(check, side_effect=modes),
+                    self.assertRaisesRegex(RuntimeError, "full decode"),
+                ):
+                    contract.validate(method)
+        with patch.dict(os.environ, {"SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "0"}):
+            method.graphs = False
+            with self.assertRaisesRegex(
+                RuntimeError, "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"
+            ):
+                contract.validate(method)
 
 
 class TestLoading(CustomTestCase):

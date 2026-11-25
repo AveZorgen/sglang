@@ -17,98 +17,26 @@ from pathlib import Path
 
 import torch
 import triton
-import triton.language as tl
 
-_WORD_BYTES = 4
-_BLOCK_WORDS = 4096
+from sglang.srt.hardware_backend.npu.moe.paged_experts_graph import (
+    _BLOCK_WORDS,
+    _HOST_ALIGNMENT,
+    _WORD_BYTES,
+    acl_call,
+    gather_rows,
+    load_acl,
+    mapped_host_range,
+)
+
 _ROW_BYTES = {"w13": 4 * 1024**2, "w2": 2 * 1024**2}
-_HOST_ALIGNMENT = 64 * 1024
-_ACL_HOST_REG_MAPPED = 0x2
-_ACL_HOST_REG_PINNED = 0x10000000
 _ACL_MEMCPY_HOST_TO_DEVICE = 1
-
-
-@triton.jit
-def gather_rows(
-    host_address,
-    src,
-    dst,
-    count,
-    slots,
-    row_words: tl.constexpr,
-    block_words: tl.constexpr,
-):
-    copy = tl.program_id(1)
-    # A2 mapped loads can fault when a load mask is used in place of this branch.
-    if copy < tl.load(count):
-        expert = tl.load(src + copy)
-        slot = tl.load(dst + copy)
-        host = tl.load(host_address).to(tl.pointer_type(tl.int32))
-        slots = slots.to(tl.pointer_type(tl.int32))
-        words = tl.program_id(0) * block_words + tl.arange(0, block_words)
-        data = tl.load(host + expert.to(tl.int64) * row_words + words)
-        tl.store(slots + slot.to(tl.int64) * row_words + words, data)
-
-
-def load_acl():
-    acl = ctypes.CDLL("libascendcl.so")
-    pointer = ctypes.c_void_p
-    size = ctypes.c_size_t
-    signatures = {
-        "aclrtMallocHost": [ctypes.POINTER(pointer), size],
-        "aclrtFreeHost": [pointer],
-        "aclrtHostRegisterV2": [pointer, ctypes.c_uint64, ctypes.c_uint32],
-        "aclrtHostGetDevicePointer": [
-            pointer,
-            ctypes.POINTER(pointer),
-            ctypes.c_uint32,
-        ],
-        "aclrtHostUnregister": [pointer],
-        "aclrtMemcpyAsync": [pointer, size, pointer, size, ctypes.c_int, pointer],
-    }
-    for name, arguments in signatures.items():
-        function = getattr(acl, name)
-        function.argtypes = arguments
-        function.restype = ctypes.c_int
-    return acl
-
-
-def acl_call(function, *arguments):
-    result = function(*arguments)
-    if result:
-        raise RuntimeError(f"{function.__name__} failed with ACL error {result}")
 
 
 @contextmanager
 def mapped_host_buffer(acl, byte_count):
-    allocation = ctypes.c_void_p()
-    acl_call(
-        acl.aclrtMallocHost, ctypes.byref(allocation), byte_count + _HOST_ALIGNMENT - 1
-    )
-    if allocation.value is None:
-        raise RuntimeError("aclrtMallocHost returned a null pointer")
-    # vLLM-Ascend's Engram path uses 64 KiB alignment for mapped reads on A3.
-    host = -(-allocation.value // _HOST_ALIGNMENT) * _HOST_ALIGNMENT
-    mapped = ctypes.c_void_p()
-    registered = False
-    try:
-        acl_call(
-            acl.aclrtHostRegisterV2,
-            host,
-            byte_count,
-            _ACL_HOST_REG_MAPPED | _ACL_HOST_REG_PINNED,
-        )
-        registered = True
-        acl_call(acl.aclrtHostGetDevicePointer, host, ctypes.byref(mapped), 0)
-        if mapped.value is None:
-            raise RuntimeError("aclrtHostGetDevicePointer returned a null pointer")
+    with mapped_host_range(acl, byte_count) as (host, mapped):
         data = (ctypes.c_int32 * (byte_count // _WORD_BYTES)).from_address(host)
-        yield torch.frombuffer(data, dtype=torch.int32), mapped.value
-    finally:
-        if registered:
-            torch.npu.synchronize()
-            acl_call(acl.aclrtHostUnregister, host)
-        acl_call(acl.aclrtFreeHost, allocation)
+        yield torch.frombuffer(data, dtype=torch.int32), mapped
 
 
 def set_plan(src, dst, count, pairs):

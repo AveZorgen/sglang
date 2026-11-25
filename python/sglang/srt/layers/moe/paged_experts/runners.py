@@ -64,7 +64,12 @@ class RunnerContract:
         the shared config."""
         return None
 
-    def validate(self) -> None:
+    def make_device_executor(self, **kwargs):
+        from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor
+
+        return DeviceExecutor(contract=self, **kwargs)
+
+    def validate(self, method) -> None:
         """Run before the checkpoint loads; raise on a server config this contract
         cannot serve (the default serves everything the shared checks admit)."""
         return None

@@ -10,82 +10,20 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 
 import torch
-import triton
-import triton.language as tl
-from bench_paged_experts_graph_transfer import (
-    _BLOCK_WORDS,
-    _WORD_BYTES,
-    gather_rows,
-    load_acl,
-    mapped_host_buffer,
+
+from sglang.srt.hardware_backend.npu.moe.paged_experts import AscendRunnerContract
+from sglang.srt.hardware_backend.npu.moe.paged_experts_graph import (
+    mapped_host_alloc,
 )
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.runtime_context import get_forward
 
 _EXPERTS = 6
 _HIDDEN = 2048
 _INTERMEDIATE = 512
 _TOP_K = 2
 _ROUTED_SCALE = 1.25
-
-
-@triton.jit
-def plan_residency(
-    ids,
-    weights,
-    live_tokens,
-    slot_expert,
-    expert_slot,
-    last_use,
-    step,
-    src,
-    dst,
-    count,
-    run_ids,
-    run_weights,
-    routes: tl.constexpr,
-    slots: tl.constexpr,
-    experts: tl.constexpr,
-    top_k: tl.constexpr,
-):
-    slot_ids = tl.arange(0, slots)
-    resident = tl.load(slot_expert + slot_ids)
-    ages = tl.load(last_use + slot_ids)
-    now = tl.load(step) + 1
-    live_routes = tl.load(live_tokens) * top_k
-    # Protect every requested resident before assigning any misses.
-    for route in range(routes):
-        expert = tl.load(ids + route)
-        valid = (route < live_routes) & (expert >= 0) & (expert < experts)
-        ages = tl.where(valid & (resident == expert), now, ages)
-    tl.store(last_use + slot_ids, ages)
-
-    misses = 0
-    for route in range(routes):
-        expert = tl.load(ids + route)
-        valid = (route < live_routes) & (expert >= 0) & (expert < experts)
-        slot = 0
-        weight = 0.0
-        if valid:
-            resident = tl.load(slot_expert + slot_ids)
-            slot = tl.min(tl.where(resident == expert, slot_ids, slots), 0)
-            if slot == slots:
-                ages = tl.load(last_use + slot_ids)
-                oldest = tl.min(tl.where(ages != now, ages, 2147483647), 0)
-                slot = tl.min(tl.where(ages == oldest, slot_ids, slots), 0)
-                evicted = tl.min(tl.where(slot_ids == slot, resident, 2147483647), 0)
-                resident = tl.where(slot_ids == slot, expert, resident)
-                ages = tl.where(slot_ids == slot, now, ages)
-                tl.store(slot_expert + slot_ids, resident)
-                tl.store(last_use + slot_ids, ages)
-                tl.store(expert_slot + evicted, -1)
-                tl.store(expert_slot + expert, slot)
-                tl.store(src + misses, expert)
-                tl.store(dst + misses, slot)
-                misses += 1
-            weight = tl.load(weights + route)
-        tl.store(run_ids + route, slot)
-        tl.store(run_weights + route, weight)
-    tl.store(step, now)
-    tl.store(count, misses)
 
 
 def run_moe(layer, hidden, ids, weights):
@@ -133,47 +71,19 @@ def finish_graph(graph):
     graph.reset()
 
 
-def capture_decode(resources, layer, hidden, weights, residency, transfers):
+def capture_decode(resources, layer, hidden, weights, method):
     device = hidden.device
     ids = torch.tensor([[0, 1]] * len(hidden), dtype=torch.int32, device=device)
     live = torch.full((1,), len(hidden), dtype=torch.int32, device=device)
-    r = residency
-    num_slots = r.slot_expert.numel()
-    assert ids.numel() <= num_slots
+    dispatch = StandardDispatchOutput(
+        hidden,
+        None,
+        StandardTopKOutput(topk_weights=weights, topk_ids=ids, router_logits=None),
+    )
 
     def forward():
-        slot_ids = torch.empty_like(ids)
-        slot_weights = torch.empty_like(weights)
-        plan_residency[(1,)](
-            ids,
-            weights,
-            live,
-            r.slot_expert,
-            r.expert_slot,
-            r.slot_lastuse,
-            r.step,
-            r.src,
-            r.dst,
-            r.count,
-            slot_ids,
-            slot_weights,
-            ids.numel(),
-            num_slots,
-            _EXPERTS,
-            _TOP_K,
-        )
-        for address, tensor in transfers:
-            row_words = tensor[0].numel() * tensor.element_size() // _WORD_BYTES
-            gather_rows[(row_words // _BLOCK_WORDS, num_slots)](
-                address,
-                r.src,
-                r.dst,
-                r.count,
-                tensor.view(torch.int32),
-                row_words,
-                _BLOCK_WORDS,
-            )
-        return run_moe(layer, hidden, slot_ids, slot_weights) * _ROUTED_SCALE
+        with get_forward().scoped(paged_experts_live_tokens=live):
+            return method.apply(layer, dispatch).hidden_states * _ROUTED_SCALE
 
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
@@ -214,13 +124,10 @@ def check_residency(label, residency, layer, store):
     return resident.tolist()
 
 
-def run_cases(device, slots, acl):
-    from sglang.srt.hardware_backend.npu.moe.paged_experts import AscendRunnerContract
-    from sglang.srt.layers.moe.paged_experts.executor import EagerExecutor
-    from sglang.srt.layers.moe.paged_experts.residency import DeviceResidency, LRUPolicy
+def run_cases(device, slots):
+    from sglang.srt.layers.moe.paged_experts.formats import UnquantizedFormat
+    from sglang.srt.layers.moe.paged_experts.method import PagedExpertsMoEMethod
     from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
     dtype = torch.bfloat16
     generator = torch.Generator().manual_seed(0)
@@ -231,14 +138,10 @@ def run_cases(device, slots, acl):
         "w2_weight": ((_HIDDEN, _INTERMEDIATE), dtype),
     }
     with ExitStack() as resources:
-        mapped = {}
 
         def alloc(shape, dtype):
-            size = math.prod(shape) * dtype.itemsize
-            host, address = resources.enter_context(mapped_host_buffer(acl, size))
-            tensor = host.view(dtype).reshape(shape)
+            tensor = mapped_host_alloc(shape, dtype)
             tensor.copy_(torch.randn(shape, generator=generator) / math.sqrt(shape[-1]))
-            mapped[shape] = torch.tensor([address], dtype=torch.int64, device=device)
             return tensor
 
         store = HostExpertStore(row_dims, _EXPERTS, alloc=alloc)
@@ -248,15 +151,15 @@ def run_cases(device, slots, acl):
         layer = SimpleNamespace(
             **{name: getattr(unpaged, name)[:slots].clone() for name in store.host}
         )
-        transfers = [
-            (mapped[tensor.shape], getattr(layer, name))
-            for name, tensor in store.host.items()
-        ]
-        state = DeviceResidency(_EXPERTS, slots, device)
+        method = PagedExpertsMoEMethod(
+            SyntheticMoE(), UnquantizedFormat(), _EXPERTS, slots, graphs=True
+        )
+        method.store = store
+        method.contract = AscendRunnerContract()
+        method._build(layer)
+        state = method.device_executor.residency
         graphs = {
-            bs: capture_decode(
-                resources, layer, hidden[:bs], weights[:bs], state, transfers
-            )
+            bs: capture_decode(resources, layer, hidden[:bs], weights[:bs], method)
             for bs in range(1, slots // _TOP_K + 1)
         }
 
@@ -288,27 +191,22 @@ def run_cases(device, slots, acl):
             replay("K=2 next miss", [[3, 2]], 1)
             return
 
+        if slots == 3:
+            replay("K=3 two misses", [[4, 5]], 2)
+            replay("K=3 repeat", [[4, 5]], 0)
+            return
+
         replay("K=4 shared miss", [[0, 4], [2, 4]], 1)
         replay("K=4 shape switch", [[2, 3], [4, 5]], 2)
         replay("K=4 padded row", [[2, 3], [0, 1]], 0, live=1)
         ids = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32, device=device)
-        eager = EagerExecutor(
-            base_method=SyntheticMoE(),
-            store=store,
-            policy=LRUPolicy(slots),
-            contract=AscendRunnerContract(),
-            num_experts=_EXPERTS,
-            routed_scaling_factor=1.0,
-        )
         dispatch = StandardDispatchOutput(
             hidden,
             None,
             StandardTopKOutput(topk_weights=weights, topk_ids=ids, router_logits=None),
         )
         # Exercise the existing eager planner and the device/host residency handoff.
-        state.load_into(eager.policy, state.count[:0])
-        actual = eager.run(layer, dispatch).hidden_states * _ROUTED_SCALE
-        state.store_from(eager.policy)
+        actual = method.apply(layer, dispatch).hidden_states * _ROUTED_SCALE
         expected = run_moe(unpaged, hidden, ids, weights) * _ROUTED_SCALE
         error = check_output("K=4 eager overflow", actual, expected)
         resident = check_residency("K=4 eager overflow", state, layer, store)
@@ -328,9 +226,8 @@ def main():
     import torch_npu  # noqa: F401
 
     torch.npu.set_device(args.device)
-    acl = load_acl()
-    for slots in (2, 4):
-        run_cases(args.device, slots, acl)
+    for slots in (2, 3, 4):
+        run_cases(args.device, slots)
     print("All synthetic Ascend MoE graph cases passed.")
 
 

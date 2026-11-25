@@ -698,6 +698,7 @@ class ForwardFlags:
     _DEFAULTS = {
         "multi_stream": False,
         "moe_output_buffer": None,
+        "paged_experts_live_tokens": None,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,
@@ -732,6 +733,7 @@ class ForwardFlags:
     # under torch.compile.
     _GRAPH_VISIBLE = frozenset(
         {
+            "paged_experts_live_tokens",
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
