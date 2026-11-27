@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.paged_experts.formats import (
     FORMATS,
     ExpertFormat,
     PostLoad,
+    UnquantizedFormat,
     expert_params,
     format_for,
 )
@@ -243,7 +244,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def _expert_cache(self, layer) -> Optional[ExpertCache]:
         """The layer's expert cache entry, once its checkpoint files are loaded: for a layer
         of more than K experts, with --paged-experts-enable-disk."""
-        if self.num_experts <= self.num_resident:
+        if (
+            self.num_experts <= self.num_resident
+            or getattr(layer, "moe_tp_size", 1) > 1
+        ):
             return None
         rows = self.loads.rows_like
         if not get_exec().moe.paged_experts_enable_disk:
@@ -520,9 +524,37 @@ def check_paged_experts_compat(layer, expert_format) -> None:
 
     problems = []
     parallel = get_parallel()
-    for name in ("tp_size", "ep_size", "pp_size", "dp_size"):
+    moe = get_exec().moe
+    num_resident = _requested_num_resident()
+    if parallel.tp_size == 8 and accelerator_type() == "npu":
+        if layer.moe_tp_size != 8 or parallel.attn_tp_size != 8:
+            problems.append(
+                "Ascend TP8 requires eight-way tensor parallelism for attention and MoE"
+            )
+        if moe.moe_a2a_backend != "none":
+            problems.append("Ascend TP8 requires --moe-a2a-backend none")
+        if (
+            not isinstance(expert_format, UnquantizedFormat)
+            or layer.params_dtype != torch.bfloat16
+        ):
+            problems.append("Ascend TP8 requires unquantized BF16 experts")
+        if num_resident is None:
+            problems.append(
+                "Ascend TP8 requires an explicit --paged-experts-num-resident"
+            )
+        if moe.paged_experts_enable_disk:
+            problems.append(
+                "--paged-experts-enable-disk has no TP-rank-specific cache keys"
+            )
+        if moe.paged_experts_host_memory_gb is not None:
+            problems.append(
+                "--paged-experts-host-memory-gb cannot budget across TP ranks yet"
+            )
+    elif parallel.tp_size > 1:
+        problems.append("--tp-size must be 1, or 8 on Ascend")
+    for name in ("ep_size", "pp_size", "dp_size"):
         if getattr(parallel, name) > 1:
-            problems.append(f"--{name.replace('_', '-')} must be 1 (single GPU only)")
+            problems.append(f"--{name.replace('_', '-')} must be 1")
     if get_exec().moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
     if get_spec().speculative_algorithm:
@@ -546,7 +578,6 @@ def check_paged_experts_compat(layer, expert_format) -> None:
         problems.append(
             f"--load-format {load_format} is not supported: {_refusal(load_format)}"
         )
-    num_resident = _requested_num_resident()
     top_k = _router_top_k(layer)
     if num_resident is not None and num_resident < top_k:
         problems.append(

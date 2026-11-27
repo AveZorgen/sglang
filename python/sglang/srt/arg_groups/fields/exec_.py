@@ -1143,8 +1143,8 @@ class ExecMoe(msgspec.Struct):
     enable_paged_experts: A[
         bool,
         "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
-        "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
-        "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
+        "page the rest from pinned host memory on demand. Ascend supports eager BF16 TP8/EP1 with "
+        "an explicit K and ND weights. See the Paged Experts docs for single-GPU configurations. "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
         "graphs must be breakable or disabled.",
     ] = False

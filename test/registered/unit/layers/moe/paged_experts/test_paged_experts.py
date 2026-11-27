@@ -807,6 +807,52 @@ class TestLoading(CustomTestCase):
             (rows[0] == 0.5).all()
         )  # not loaded: as the base method created
 
+    def test_tp8_pages_native_gate_up_and_down_shards(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        class Base(_LinearMoE):
+            def create_weights(self, layer, num_experts, **kwargs):
+                for name, shape in (("w13_weight", (2 * H, H)), ("w2_weight", (H, H))):
+                    layer.register_parameter(
+                        name,
+                        torch.nn.Parameter(
+                            torch.zeros(num_experts, *shape), requires_grad=False
+                        ),
+                    )
+
+        # Expert E-1 starts outside the K slots. Each rank must replay its own
+        # checkpoint slice into the host store and copy it back on a miss.
+        gate, up, down = (
+            torch.arange(8 * H * H).reshape(-1, H).float() + offset
+            for offset in (0, 1000, 2000)
+        )
+        down = down.T.contiguous()
+        for rank in range(8):
+            with self.subTest(rank=rank):
+                layer = FusedMoE.__new__(FusedMoE)
+                torch.nn.Module.__init__(layer)
+                layer.moe_tp_size, layer.moe_tp_rank = 8, rank
+                layer.use_presharded_weights = layer.use_padded_loading = False
+                layer.use_flashinfer_trtllm_moe = layer._has_fused_shared = False
+                layer.moe_runner_config = SimpleNamespace(is_gated=True)
+                layer.quant_config = None
+                layer.top_k = TOP_K
+                method = PagedExpertsMoEMethod(Base(), UnquantizedFormat(), E, K)
+                _create(method, layer, CONTRACTS[0])
+                for shard, param, weight in (
+                    ("w1", layer.w13_weight, gate),
+                    ("w3", layer.w13_weight, up),
+                    ("w2", layer.w2_weight, down),
+                ):
+                    param.weight_loader(param, _mapped(weight), "weight", shard, E - 1)
+                _load(method, layer)
+                method.store.page_in(layer, [(E - 1, 0)])
+                part = slice(rank * H, (rank + 1) * H)
+                torch.testing.assert_close(
+                    layer.w13_weight[0], torch.cat((gate[part], up[part]))
+                )
+                torch.testing.assert_close(layer.w2_weight[0], down[:, part])
+
     def test_stacked_checkpoint_goes_to_the_native_loader_as_called(self):
         """A checkpoint tensor holding every expert (e.g. gpt-oss) goes, as called, to the
         layer's native loader (fused for bf16, padded for MXFP4) on a table of every expert,
@@ -1528,6 +1574,9 @@ class TestCompat(CustomTestCase):
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
             enable_eplb=False,
+            moe_a2a_backend=flags.get("moe_a2a_backend", "none"),
+            paged_experts_enable_disk=flags.get("disk", False),
+            paged_experts_host_memory_gb=flags.get("budget"),
             paged_experts_num_resident=num_resident,
             enable_fused_moe_sum_all_reduce=False,
         )
@@ -1538,12 +1587,23 @@ class TestCompat(CustomTestCase):
             enable_nvidia_megakernel=flags.get("enable_nvidia_megakernel", False)
         )
         lora = SimpleNamespace(enable_lora=flags.get("enable_lora", False))
-        layer = SimpleNamespace(top_k=TOP_K, num_fused_shared_experts=0)
+        tp = flags.get("tp_size", 1)
+        layer = SimpleNamespace(
+            top_k=TOP_K,
+            num_fused_shared_experts=0,
+            moe_tp_size=flags.get("moe_tp_size", tp),
+            params_dtype=flags.get("dtype", torch.bfloat16),
+        )
         with (
+            patch(method + "accelerator_type", return_value=flags.get("device", "npu")),
             patch(
                 method + "get_parallel",
                 return_value=SimpleNamespace(
-                    tp_size=1, ep_size=1, pp_size=1, dp_size=1
+                    tp_size=tp,
+                    attn_tp_size=flags.get("attn_tp_size", tp),
+                    ep_size=flags.get("ep_size", 1),
+                    pp_size=1,
+                    dp_size=flags.get("dp_size", 1),
                 ),
             ),
             patch(
@@ -1563,10 +1623,33 @@ class TestCompat(CustomTestCase):
             ),
             patch(method + "check_cuda_graph_backend", return_value=True),
         ):
-            check_paged_experts_compat(layer=layer, expert_format=object())
+            check_paged_experts_compat(
+                layer=layer, expert_format=flags.get("fmt", UnquantizedFormat())
+            )
 
     def test_accepts_a_supported_config(self):
         self._check()
+
+    def test_ascend_tp8(self):
+        self._check(tp_size=8)
+        for options, message in (
+            ({"device": "cuda"}, "--tp-size"),
+            ({"ep_size": 8}, "--ep-size"),
+            ({"dp_size": 2}, "--dp-size"),
+            ({"attn_tp_size": 4}, "attention and MoE"),
+            ({"moe_tp_size": 4}, "attention and MoE"),
+            ({"moe_a2a_backend": "ascend_ops"}, "--moe-a2a-backend none"),
+            ({"dtype": torch.float16}, "BF16"),
+            ({"fmt": formats.Fp8BlockFormat()}, "BF16"),
+            ({"num_resident": "auto"}, "explicit"),
+            ({"disk": True}, "cache keys"),
+            ({"budget": 128}, "--paged-experts-host-memory-gb"),
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                self._check(tp_size=8, **options)
 
     def test_only_loaders_that_fill_through_load_weights_are_accepted(self):
         """The loaders that fill the experts through model.load_weights and then run the

@@ -82,7 +82,15 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   | ModelOpt NVFP4 | Marlin | pass `--moe-runner-backend marlin`; runs W4A16 |
 
   Other quantization methods and MoE runners are rejected at startup.
-- **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
+- **Ascend TP8/EP1:** Use eight NPUs with unquantized BF16 experts, eager execution, and ND
+  weights. Each rank pins its own intermediate-dimension shard of every expert and keeps K
+  shards resident per layer. Set `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1` and pass
+  `--tp-size 8 --ep-size 1 --moe-a2a-backend none --dtype bfloat16 --enable-paged-experts`,
+  an explicit `--paged-experts-num-resident K`, `--disable-shared-experts-fusion`, and
+  `--disable-decode-cuda-graph --disable-prefill-cuda-graph`. The host must fit the pinned
+  shards across its ranks. Disk caching and `--paged-experts-host-memory-gb` are unsupported
+  in this configuration.
+- **Parallelism:** CUDA uses a single GPU. Expert, pipeline and data parallelism, EPLB, fused shared experts
   (use `--disable-shared-experts-fusion`) and `--enable-fused-moe-sum-all-reduce` are rejected
   at startup.
 - **Speculative decoding** is rejected at startup.
